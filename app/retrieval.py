@@ -50,29 +50,91 @@ def load_pages(source: Path = RAG_SOURCE) -> list[dict]:
 
 
 def browse_tree(node_id: str | None = None) -> dict:
-    """直下のページは先頭文、指定したページ自身は全文を返す。"""
+    """目次、候補文、章境界を越えた周辺ページを返す。"""
     tree = json.loads(RAG_TREE.read_text(encoding="utf-8"))
     tree["children"] = [node for node in tree["children"] if node["id"] in RAG_DOCUMENT_IDS]
     node_id = node_id or tree["id"]
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
+
+    def candidate_preview(content: str) -> str:
+        text = content.strip()
+        if not text:
+            return ""
+        lines = text.splitlines()
+        first_line = lines[0].strip()
+        if not first_line:
+            return ""
+        # 最初の段落ではなく、候補として判別しやすい最大2文を返す。
+        sentences = re.split(r"(?<=[。！？.!?])", first_line)
+        preview = "".join(sentences[:2]).strip()[:600]
+        if preview:
+            return preview
+        return first_line[:600]
+
+    def flatten_page_nodes(node: dict) -> list[dict]:
+        if node["kind"] == "page":
+            return [node]
+        result = []
+        for child in node.get("children", []):
+            result.extend(flatten_page_nodes(child))
+        return result
 
     def describe(node, full=False):
         info = {key: node[key] for key in ("id", "kind", "title")}
         if node["kind"] == "page":
             info.update({key: value for key, value in pages[node["id"]].items() if key != "page_id"})
             if not full:
-                info["content"] = re.split(r"(?<=[。！？])|\n", info["content"].strip(), maxsplit=1)[0]
+                info["content"] = candidate_preview(info["content"])
+        else:
+            page_nodes = flatten_page_nodes(node)
+            info["page_count"] = len(page_nodes)
+            if page_nodes:
+                first_page = pages[page_nodes[0]["id"]]
+                info["preview"] = candidate_preview(first_page["content"])
         return info
 
-    remaining = [tree]
+    remaining = [(tree, [])]
     while remaining:
-        node = remaining.pop()
+        node, breadcrumb = remaining.pop()
         if node["id"] == node_id:
-            return {
+            result = {
                 "node": describe(node, full=True),
                 "children": [describe(child) for child in node.get("children", [])],
+                "breadcrumb": breadcrumb + [describe(node)],
             }
-        remaining.extend(node.get("children", []))
+            if node["kind"] == "page":
+                page = pages[node["id"]]
+                result["context"] = _neighbor_context(
+                    node["id"], page["document_id"], pages
+                )
+                result["context_scope"] = "same_document_neighbor_pages"
+            elif node["kind"] == "section":
+                parent = breadcrumb[-1]["id"] if breadcrumb else None
+                document = None
+                remaining_for_search = [tree]
+                while remaining_for_search:
+                    candidate = remaining_for_search.pop()
+                    if candidate["id"] == parent:
+                        document = candidate
+                        break
+                    remaining_for_search.extend(candidate.get("children", []))
+                if document is not None:
+                    sections = [
+                        child for child in document.get("children", [])
+                        if child["kind"] == "section"
+                    ]
+                    index = next(
+                        (i for i, section in enumerate(sections) if section["id"] == node["id"]),
+                        None,
+                    )
+                    if index is not None:
+                        result["neighbor_sections"] = [
+                            describe(section)
+                            for section in sections[max(0, index - 1):index + 2]
+                        ]
+            return result
+        for child in reversed(node.get("children", [])):
+            remaining.append((child, breadcrumb + [describe(node)]))
     raise ValueError("対象の目次ノードが見つかりません。")
 
 
@@ -82,6 +144,31 @@ def read_page(page_id: str) -> dict:
         if page["page_id"] == page_id:
             return page
     raise ValueError("対象のページが見つかりません。")
+
+
+def _neighbor_context(page_id: str, document_id: str, pages: dict[str, dict]) -> list[dict]:
+    """同じ資料内の指定ページと前後1ページを、重複なく本文順に返す。"""
+    document_pages = [
+        (index, page)
+        for index, page in enumerate(pages.values())
+        if page["document_id"] == document_id
+    ]
+    document_pages.sort(key=lambda item: (item[1]["page"], item[0]))
+    hit_index = next(
+        (index for index, (_, page) in enumerate(document_pages)
+         if page["page_id"] == page_id),
+        None,
+    )
+    if hit_index is None:
+        return []
+
+    context = []
+    seen = set()
+    for _, page in document_pages[max(0, hit_index - 1):hit_index + 2]:
+        if page["page_id"] not in seen:
+            context.append(page)
+            seen.add(page["page_id"])
+    return context
 
 
 def normalized_vector(values: list[float]) -> list[float]:
@@ -128,6 +215,7 @@ def search(query: str) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+    pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
     with open_index(RAG_DB) as db:
         vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
         rows = db.execute("""
@@ -135,7 +223,32 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        results = []
+        for row in rows:
+            hit = dict(row)
+            source_hit = pages.get(hit["page_id"])
+            source_matches_hit = (
+                source_hit is not None
+                and source_hit["document_id"] == hit["document_id"]
+                and source_hit["page"] == hit["page"]
+                and source_hit["title"] == hit["title"]
+            )
+            context = (
+                _neighbor_context(hit["page_id"], hit["document_id"], pages)
+                if source_matches_hit
+                else []
+            )
+            if not context:
+                context = [hit]
+            else:
+                context = [
+                    {**page, "content": hit["content"]} if page["page_id"] == hit["page_id"] else page
+                    for page in context
+                ]
+            hit["context"] = context
+            hit["content"] = "\n\n".join(page["content"] for page in context)
+            results.append(hit)
+        return results
 
 
 def search_graph(query: str) -> dict:
@@ -156,7 +269,9 @@ def search_graph(query: str) -> dict:
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
         root = seed["page_id"]
-        results.append({**pages[root], "distance": seed["distance"], "hops": 0,
+        context = _neighbor_context(root, pages[root]["document_id"], pages)
+        results.append({**pages[root], "content": "\n\n".join(page["content"] for page in context),
+                        "context": context, "distance": seed["distance"], "hops": 0,
                         "path": [{"id": root, "title": pages[root]["title"]}]})
         queue = deque([(root, [root])])
         visited = {root}
@@ -176,7 +291,9 @@ def search_graph(query: str) -> dict:
                     continue
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
                 priority = (len(route) - 1, frequency, rank, neighbor)
-                candidate = {**pages[neighbor], "hops": len(route) - 1,
+                context = _neighbor_context(neighbor, pages[neighbor]["document_id"], pages)
+                candidate = {**pages[neighbor], "content": "\n\n".join(page["content"] for page in context),
+                             "context": context, "hops": len(route) - 1,
                              "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)

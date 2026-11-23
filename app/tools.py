@@ -99,9 +99,10 @@ def search_materials(query: str) -> str:
 
 
 def browse_tree(node_id: str | None = None) -> str:
-    """目次とページの先頭文を返す。ページIDを指定すると全文を返す。
+    """目次、候補文、章の周辺情報を返す。ページIDを指定すると全文と前後ページを返す。
 
-    最初はnode_idを省略する。続いて返されたIDを指定して目次をたどる。
+    最初はnode_idを省略する。続いて返されたIDで講義、章、ページをたどる。
+    chapterをまたぐ質問では、neighbor_sectionsやcontextを確認し、必要な別のページも読み直す。
     """
     from app.retrieval import browse_tree as browse
 
