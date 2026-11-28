@@ -4,11 +4,18 @@
 
 <!-- [tool call] の行は、表示された行をそのまま貼り付けてください。終わらなかった STEP は、空欄のままでかまいません。 -->
 
-- STEP 1 のツールの名前：
-- STEP 2 の [tool call]：
-- STEP 3 の [tool call]：
+- STEP 1 のツールの名前：glossary_search_glossary
+- STEP 2 の [tool call]：glossary_search_glossary({'query': '3レベル'})
+- STEP 3 の [tool call]：fetch_fetch({'url': 'https://modelcontextprotocol.io/'})
 - STEP 4 の [tool call]：
+・aws_aws___search_documentation({'topics': ['general'], 'search_phrase': 'Amazon S3 バージョニング 概要'})
+・aws_aws___search_documentation({'topics': ['general'], 'search_phrase': 'Using versioning in S3 buckets overview'})
+
 - 気づき・疑問：
+・第3回の演習では、このコード上のエージェントがtool callを直接行っていたが、今回はMCP サーバーが関数を呼び、結果をエージェントに返していた。実際、今回の「モデル応答」は 2 回で、tool callとtool returnの2段階になっている。
+・aws を設定したSTEP4では、起動したコマンドはなく、サーバーはAWS が動かしエージェントが URL に接続することで、入力した質問の内容をAWS に送っていた。
+
+
 
 ## 宿題
 
